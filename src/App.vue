@@ -13,14 +13,31 @@ import {
   onStreamStatus,
   startEventStream,
   stopEventStream,
+  waxumChatMessages,
   waxumGroupInfo,
+  waxumSearch,
   waxumSendText,
   waxumSessionMessages,
   waxumStatus,
 } from "./lib/waxum";
 import { speak } from "./lib/voice";
 import { parseCommand } from "./lib/commandParser";
-import { aiConfigured, aiConverse, onAiStream, onAiTool, type AiContact } from "./lib/ai";
+import {
+  bestMatch,
+  chronological,
+  extractContacts,
+  extractMessages,
+  messageLine,
+  type ContactCandidate,
+} from "./lib/contactMatch";
+import {
+  aiConfigured,
+  aiConverse,
+  aiResetConversation,
+  onAiStream,
+  onAiTool,
+  type AiContact,
+} from "./lib/ai";
 import { motion, AnimatePresence } from "motion-v";
 
 const ready = ref(false);
@@ -58,9 +75,17 @@ async function speakState(s: Settings, text: string) {
 
 function submitTyped() {
   const text = typedCommand.value.trim();
-  if (!text) return;
+  const s = settings.value;
+  if (!text || !s) return;
   typedCommand.value = "";
-  onTranscript(text);
+  // Typed commands skip the wake-word gate. The gate exists so an
+  // always-open mic never treats overheard speech as a command; there is
+  // nothing to gate when the user typed it on purpose. Going through
+  // onTranscript() here meant the input box silently did nothing unless
+  // you typed "hey jarvis" first and then the command as a second line.
+  clearAwakeTimer();
+  awaitingCommand.value = false;
+  void processCommand(s, text);
 }
 const log = reactive<{ id: string; text: string; kind: "in" | "out" | "system"; time: string }[]>([]);
 
@@ -73,6 +98,10 @@ interface ChatEntry {
 const HISTORY_PER_CHAT = 10;
 const knownChats = reactive(new Map<string, ChatEntry>());
 
+/** Group whose messages arrived most recently -- what "grup ini" means in
+ * "cek pesan di grup ini". */
+let lastGroupJid = "";
+
 function appendChatMessage(name: string, jid: string, text: string) {
   const key = name.toLowerCase();
   const entry = knownChats.get(key) ?? { jid, messages: [] };
@@ -80,6 +109,7 @@ function appendChatMessage(name: string, jid: string, text: string) {
   entry.messages.push(text);
   if (entry.messages.length > HISTORY_PER_CHAT) entry.messages.shift();
   knownChats.set(key, entry);
+  if (jid.endsWith("@g.us")) lastGroupJid = jid;
 }
 
 /** group jid -> subject, so a group's context/log entries are keyed by
@@ -128,19 +158,17 @@ async function loadHistory() {
   const s = settings.value!;
   try {
     const res = await waxumSessionMessages(s, 50);
-    const messages = [...(res.messages ?? [])].reverse();
-    for (const m of messages) {
-      if (seenMessageIds.has(m.message_id)) continue;
-      seenMessageIds.add(m.message_id);
-      const text = m.body || `[${m.msg_type}]`;
-      const isGroup = (m.chat_jid as string).endsWith("@g.us");
-      if (isGroup) {
-        const groupName = await resolveGroupName(m.chat_jid);
-        const sender = m.push_name || (m.sender_jid as string).split("@")[0];
-        appendChatMessage(groupName, m.chat_jid, `${sender}: ${text}`);
+    for (const m of chronological(extractMessages(res))) {
+      if (m.messageId && seenMessageIds.has(m.messageId)) continue;
+      if (m.messageId) seenMessageIds.add(m.messageId);
+      // messageLine() already prefixes the sender for groups, so both
+      // branches store the same shape handleIncoming() does.
+      if (m.isGroup) {
+        const groupName = await resolveGroupName(m.chatJid);
+        appendChatMessage(groupName, m.chatJid, messageLine(m));
       } else {
-        const name = m.push_name || (m.chat_jid as string).split("@")[0];
-        appendChatMessage(name, m.chat_jid, text);
+        const name = m.senderName || m.chatJid.split("@")[0];
+        appendChatMessage(name, m.chatJid, messageLine(m));
       }
     }
     historyLoaded = true;
@@ -158,8 +186,24 @@ async function boot() {
   if (configured) await connect();
 }
 
+/** Everything learned from the previous connection is dropped before a new
+ * one starts. After switching servers/sessions (or reconnecting) a stale
+ * knownChats/seenMessageIds silently answered commands with the old
+ * session's contacts, and `historyLoaded` stayed true, so the new
+ * session's history was never fetched at all. */
+function resetSessionCaches() {
+  knownChats.clear();
+  groupNames.clear();
+  seenMessageIds.clear();
+  lastGroupJid = "";
+  historyLoaded = false;
+  streamingReply.value = "";
+  aiResetConversation().catch(() => {});
+}
+
 async function connect() {
   const s = settings.value!;
+  resetSessionCaches();
   busy.value = true;
   statusLine.value = "connecting…";
   try {
@@ -242,13 +286,71 @@ async function handleIncoming(msg: IncomingMessage) {
   }
 }
 
-function resolveChat(spokenName: string): ChatEntry | undefined {
-  const key = spokenName.trim().toLowerCase();
-  if (knownChats.has(key)) return knownChats.get(key);
-  for (const [name, entry] of knownChats) {
-    if (name.includes(key) || key.includes(name)) return entry;
+/** Instant, offline resolution against everything the stream has seen this
+ * run. `groupsOnly` keeps "grup keluarga" from resolving to a person whose
+ * name happens to contain it. Scoring (exact > whole word > substring >
+ * edit distance) lives in lib/contactMatch.ts, shared with the live-search
+ * fallback below and with the Rust side's `search_contact` tool. */
+function resolveChat(spokenName: string, groupsOnly = false): ChatEntry | undefined {
+  const entries = [...knownChats.entries()]
+    .filter(([, entry]) => !groupsOnly || entry.jid.endsWith("@g.us"))
+    .map(([name, entry]) => ({ name, entry }));
+  return bestMatch(spokenName, entries, (c) => c.name)?.entry;
+}
+
+/** Resolves a spoken name to a chat, asking waxum when the local cache
+ * doesn't have it -- without the search fallback "balas ke budi" only ever
+ * worked for people who happened to message us since the app started. A
+ * hit is cached under the name the server reported, so the next command
+ * resolves offline. */
+async function resolveContact(
+  spokenName: string,
+  groupsOnly = false,
+): Promise<ChatEntry | undefined> {
+  const local = resolveChat(spokenName, groupsOnly);
+  if (local) return local;
+  const s = settings.value;
+  const query = spokenName.trim();
+  if (!s || !query) return undefined;
+  try {
+    const found: ContactCandidate[] = extractContacts(await waxumSearch(s, query)).filter(
+      (c) => !groupsOnly || c.jid.endsWith("@g.us"),
+    );
+    // The server already filtered by the query, so its first hit is a
+    // reasonable answer when no name scores high enough on its own.
+    const hit = bestMatch(query, found, (c) => c.name) ?? found[0];
+    if (!hit) return undefined;
+    const entry: ChatEntry = { jid: hit.jid, messages: [] };
+    knownChats.set(hit.name.toLowerCase(), entry);
+    return entry;
+  } catch (e) {
+    pushLog(`pencarian kontak gagal: ${e}`, "system");
+    return undefined;
   }
-  return undefined;
+}
+
+/** The most recently active group -- "cek pesan di grup ini". */
+function currentGroup(): ChatEntry | undefined {
+  if (!lastGroupJid) return undefined;
+  return [...knownChats.values()].find((e) => e.jid === lastGroupJid);
+}
+
+/** Latest messages straight from waxum for one chat, oldest-first, merged
+ * into the local cache so later commands and the AI path see them too. The
+ * cache only ever holds what arrived while the app was running, so a chat
+ * that has been quiet since before launch would otherwise read as empty. */
+async function fetchChatLines(s: Settings, jid: string): Promise<string[]> {
+  try {
+    const lines = chronological(extractMessages(await waxumChatMessages(s, jid, 10))).map(
+      messageLine,
+    );
+    const cached = [...knownChats.values()].find((e) => e.jid === jid);
+    if (cached && lines.length) cached.messages = lines.slice(-HISTORY_PER_CHAT);
+    return lines;
+  } catch (e) {
+    pushLog(`gagal memuat pesan: ${e}`, "system");
+    return [];
+  }
 }
 
 /** Wake-word gate, Siri/Alexa-style: the realtime mic is always
@@ -298,52 +400,93 @@ async function onTranscript(raw: string) {
   await processCommand(s, raw);
 }
 
-/** The actual command pipeline, run once a transcript arrives inside the
- * awake window -- unchanged from before the wake-word gate was added. */
+/** The actual command pipeline: run once a transcript arrives inside the
+ * awake window, or immediately for a typed command. */
 async function processCommand(s: Settings, raw: string) {
   pushLog(raw, "out");
   transientState.value = "thinking";
 
-  if (aiConfigured(s)) {
-    await handleWithAi(s, raw);
-    return;
-  }
+  try {
+    const intent = parseCommand(raw);
 
-  const intent = parseCommand(raw);
-  switch (intent.kind) {
-    case "read_latest": {
-      const entry = intent.from ? resolveChat(intent.from) : [...knownChats.values()].at(-1);
-      if (!entry) {
-        await speakState(s, "Tidak ada pesan yang sesuai dalam basis data.");
+    // The fixed shapes are handled locally and instantly; only what they
+    // cannot express reaches the model. Sending *every* transcript to the
+    // AI whenever one was configured put a network round trip in front of
+    // "list sesi" and turned a deterministic command into a failure the
+    // moment the endpoint was slow or down -- exactly what the regex
+    // parser exists to avoid. handleWithAi() is documented as the fallback
+    // for unparsed speech, and now behaves like one.
+    if (intent.kind === "unknown") {
+      await handleWithAi(s, raw);
+      return;
+    }
+
+    switch (intent.kind) {
+      case "read_latest": {
+        const entry = intent.from
+          ? await resolveContact(intent.from)
+          : [...knownChats.values()].at(-1);
+        if (!entry) {
+          await speakState(s, "Tidak ada pesan yang sesuai dalam basis data.");
+          break;
+        }
+        // A named chat is read from waxum directly -- the local cache only
+        // holds what arrived this run, so "baca pesan dari budi" used to
+        // answer "no such message" for anyone who had not just messaged us.
+        let lines = entry.messages;
+        if (intent.from) {
+          const live = await fetchChatLines(s, entry.jid);
+          if (live.length) lines = live;
+        }
+        await speakState(s, lines.at(-1) ?? "Tidak ada isi pesan.");
         break;
       }
-      await speakState(s, entry.messages.at(-1) ?? "Tidak ada isi pesan.");
-      break;
-    }
-    case "send_message": {
-      const entry = resolveChat(intent.to);
-      if (!entry) {
-        await speakState(s, `Kontak ${intent.to} tidak ditemukan dalam percakapan aktif.`);
-        pushLog(`unresolved contact: "${intent.to}"`, "system");
+      case "read_group": {
+        const entry = intent.group
+          ? await resolveContact(intent.group, true)
+          : currentGroup();
+        if (!entry) {
+          await speakState(
+            s,
+            intent.group
+              ? `Grup ${intent.group} tidak ditemukan dalam percakapan aktif.`
+              : "Belum ada grup yang aktif.",
+          );
+          break;
+        }
+        const live = await fetchChatLines(s, entry.jid);
+        const lines = live.length ? live : entry.messages;
+        const name = await resolveGroupName(entry.jid);
+        const latest = lines.at(-1);
+        await speakState(s, latest ? `Di ${name}: ${latest}` : `Belum ada pesan di ${name}.`);
         break;
       }
-      try {
-        await waxumSendText(s, entry.jid, intent.text);
-        pushLog(`sent to ${intent.to}: ${intent.text}`, "system");
-        await speakState(s, `Pesan telah dikirim kepada ${intent.to}.`);
-      } catch (e) {
-        await speakState(s, "Pengiriman pesan gagal.");
-        pushLog(`send failed: ${e}`, "system");
+      case "send_message": {
+        const entry = await resolveContact(intent.to);
+        if (!entry) {
+          await speakState(s, `Kontak ${intent.to} tidak ditemukan dalam percakapan aktif.`);
+          pushLog(`unresolved contact: "${intent.to}"`, "system");
+          break;
+        }
+        try {
+          await waxumSendText(s, entry.jid, intent.text);
+          pushLog(`sent to ${intent.to}: ${intent.text}`, "system");
+          await speakState(s, `Pesan telah dikirim kepada ${intent.to}.`);
+        } catch (e) {
+          await speakState(s, "Pengiriman pesan gagal.");
+          pushLog(`send failed: ${e}`, "system");
+        }
+        break;
       }
-      break;
+      case "list_sessions":
+        await speakState(s, `${knownChats.size} percakapan aktif terdeteksi.`);
+        break;
     }
-    case "list_sessions":
-      await speakState(s, `${knownChats.size} percakapan aktif terdeteksi.`);
-      break;
-    case "unknown":
-      pushLog(`unrecognized command: "${intent.raw}"`, "system");
-      await speakState(s, "Perintah tidak dikenali. Atur AI di pengaturan untuk mode obrolan bebas.");
-      break;
+  } finally {
+    // speakState() clears this on its way out; this is the safety net for a
+    // branch that throws (a failed lookup) before it ever speaks, which
+    // otherwise left the robot face stuck on "thinking" for good.
+    if (transientState.value === "thinking") transientState.value = null;
   }
 }
 
@@ -358,7 +501,10 @@ async function processCommand(s: Settings, raw: string) {
 async function handleWithAi(s: Settings, transcript: string) {
   if (!aiConfigured(s)) {
     pushLog(`unrecognized command: "${transcript}"`, "system");
-    await speakState(s, "Perintah tidak dikenali.");
+    await speakState(
+      s,
+      "Perintah tidak dikenali. Atur AI di pengaturan untuk mode obrolan bebas.",
+    );
     return;
   }
   const contacts: AiContact[] = [...knownChats.entries()].map(([name, e]) => ({
