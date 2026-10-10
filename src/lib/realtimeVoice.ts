@@ -30,12 +30,14 @@ export class RealtimeVoice {
   private stream: MediaStream | null = null;
   private readonly sampleRate = 16000;
 
-  /** Set by `stop()`. `start()` awaits a token mint and a websocket
-   * handshake before it owns any resources, so a stop() landing in that
-   * window used to find nothing to tear down and then watch start() finish
-   * anyway -- leaving a live websocket and a live mic stream behind that
-   * nothing had a handle on any more. */
-  private closed = false;
+  /** Bumped by every `start()` and by `stop()`. `start()` awaits a token
+   * mint and a websocket handshake before it owns any resources, so a stop()
+   * (or a second start()) landing in that window used to find nothing to
+   * tear down and then watch start() finish anyway -- leaving a live
+   * websocket and a live mic stream behind that nothing had a handle on any
+   * more. A plain boolean is wrong here: the next start() would clear it
+   * again and un-cancel the first one. A generation is per-start. */
+  private generation = 0;
 
   /** True while the assistant's own TTS is playing — audio capture keeps
    * running (so the websocket doesn't idle-timeout) but chunks are not
@@ -50,11 +52,11 @@ export class RealtimeVoice {
   }
 
   async start(settings: Settings, onEvent: (e: RealtimeEvent) => void): Promise<void> {
-    this.closed = false;
+    const generation = ++this.generation;
     const token = await invoke<string>("elevenlabs_mint_realtime_token", {
       apiKey: settings.elevenLabsApiKey,
     });
-    if (this.closed) return;
+    if (generation !== this.generation) return;
     const url =
       `wss://api.elevenlabs.io/v1/speech-to-text/realtime` +
       `?token=${encodeURIComponent(token)}` +
@@ -105,21 +107,33 @@ export class RealtimeVoice {
       ws.addEventListener("close", onClose);
     });
 
-    if (this.closed) {
+    if (generation !== this.generation) {
       ws.close();
       this.ws = null;
       return;
     }
 
     this.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
-    if (this.closed) {
+    if (generation !== this.generation) {
       this.stream.getTracks().forEach((t) => t.stop());
       this.stream = null;
       ws.close();
       this.ws = null;
       return;
     }
-    const audioCtx = new AudioContext();
+    // Anything that throws from here on (permission revoked between the two
+    // awaits, no audio output device) used to leave the socket open and the
+    // mic live for whoever called start() to notice.
+    let audioCtx: AudioContext;
+    try {
+      audioCtx = new AudioContext();
+    } catch (e) {
+      this.stream.getTracks().forEach((t) => t.stop());
+      this.stream = null;
+      ws.close();
+      this.ws = null;
+      throw e;
+    }
     this.audioCtx = audioCtx;
     this.source = audioCtx.createMediaStreamSource(this.stream);
     this.processor = audioCtx.createScriptProcessor(4096, 1, 1);
@@ -148,7 +162,7 @@ export class RealtimeVoice {
   }
 
   stop(): void {
-    this.closed = true;
+    this.generation += 1;
     this.processor?.disconnect();
     this.source?.disconnect();
     this.mute?.disconnect();

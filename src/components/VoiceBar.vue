@@ -28,6 +28,11 @@ let retryTimer: ReturnType<typeof setTimeout> | null = null;
 /** True while a connect is in flight, so the watcher and a retry can't both
  * walk into start() and end up with two live mic captures. */
 let connecting = false;
+/** A start that was asked for while a connect was in flight. Dropping it
+ * instead is what turned "the socket closed during getUserMedia" into a mic
+ * that never came back: the retry fired while `connecting` was still true,
+ * returned silently, and nothing re-armed it. */
+let pendingStart = false;
 let retryDelay = RETRY_MIN_MS;
 /** One log line per outage, not one per attempt. */
 let failureReported = false;
@@ -91,8 +96,12 @@ watch(
 );
 
 async function start() {
-  if (listening.value || connecting || !props.settings.elevenLabsApiKey) {
-    if (!props.settings.elevenLabsApiKey) emit("error", "realtime mode needs an ElevenLabs API key in settings");
+  if (!props.settings.elevenLabsApiKey) {
+    emit("error", "realtime mode needs an ElevenLabs API key in settings");
+    return;
+  }
+  if (listening.value || connecting) {
+    if (connecting && wanted()) pendingStart = true;
     return;
   }
   connecting = true;
@@ -144,11 +153,20 @@ async function start() {
     scheduleRetry("gagal tersambung");
   } finally {
     connecting = false;
+    if (pendingStart) {
+      pendingStart = false;
+      if (wanted() && !listening.value) void start();
+    }
   }
 }
 
 function stop() {
   clearRetry();
+  // A connect that is still awaiting the token mint or getUserMedia can't be
+  // cancelled from here (RealtimeVoice tears its own resources down), so
+  // don't leave the flag set and block every later start behind it.
+  connecting = false;
+  pendingStart = false;
   realtime?.stop();
   realtime = null;
   listening.value = false;

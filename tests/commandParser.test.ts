@@ -83,12 +83,25 @@ test("a name that starts with a separator word is not torn in half", () => {
 
 test("a colon may butt straight up against the contact name", () => {
   assert.deepEqual(parseCommand("balas ke budi: otw"), { kind: "send_message", to: "budi", text: "otw" });
-  assert.deepEqual(parseCommand("balas ke budi:otw"), { kind: "send_message", to: "budi", text: "otw" });
   assert.deepEqual(parseCommand("kirim pesan ke budi: otw"), {
     kind: "send_message",
     to: "budi",
     text: "otw",
   });
+  assert.deepEqual(parseCommand("kirimkan ke budi:  otw"), {
+    kind: "send_message",
+    to: "budi",
+    text: "otw",
+  });
+});
+
+test("a colon inside the message body is not mistaken for the separator", () => {
+  // These matched no pattern before the colon form was added, so they went to
+  // the AI. A ':' separator that does not require whitespace after it quietly
+  // re-routed them to the wrong contact with a mangled body.
+  assert.equal(parseCommand("balas ke budi jam 10:30 nanti").kind, "unknown");
+  assert.equal(parseCommand("balas ke budi:otw").kind, "unknown");
+  assert.equal(parseCommand("kirim pesan ke budi rapat jam 09:00").kind, "unknown");
 });
 
 test("reads accept 'baca' and 'bacain', not the typo 'bacai'", () => {

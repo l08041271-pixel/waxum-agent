@@ -184,7 +184,8 @@ export function extractContacts(payload: unknown): ContactCandidate[] {
     // the reply in front of everyone.
     const name = isGroup
       ? pick(row, ["chat_name", "subject", "group_name"]) || jidName(jid)
-      : pick(row, ["chat_name", "contact_name", "push_name", "name"]) || jidName(jid);
+      : pick(row, ["chat_name", "contact_name", "push_name", "sender_name", "name"]) ||
+        jidName(jid);
     seen.add(jid);
     out.push({ name, jid });
   }

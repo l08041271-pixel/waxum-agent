@@ -37,9 +37,9 @@ const CURRENT_GROUP = /^(ini|itu|tersebut|yang ini|yang itu)$/i;
 // A colon is unambiguous, so it is allowed to butt straight up against the
 // name ("kirimkan ke budi: otw") -- which is how dictation usually arrives.
 const SEND_PATTERNS = [
-  /^(?:balas|reply)\s+(?:ke\s+)?(.+?)(?:\s+(?:bilang|dengan|isi(?:nya)?)(?![a-z0-9])|:)\s*(.+)$/i,
-  /^kirim(?:kan)?\s+pesan\s+ke\s+(.+?)(?:\s+(?:bilang|isi(?:nya)?)(?![a-z0-9])|:)\s*(.+)$/i,
-  /^kirim(?:kan)?\s+ke\s+(.+?)(?:\s+(?:bilang)(?![a-z0-9])|:)\s*(.+)$/i,
+  /^(?:balas|reply)\s+(?:ke\s+)?(.+?)(?:\s+(?:bilang|dengan|isi(?:nya)?)(?![a-z0-9])\s*|:\s+)(.+)$/i,
+  /^kirim(?:kan)?\s+pesan\s+ke\s+(.+?)(?:\s+(?:bilang|isi(?:nya)?)(?![a-z0-9])\s*|:\s+)(.+)$/i,
+  /^kirim(?:kan)?\s+ke\s+(.+?)(?:\s+(?:bilang)(?![a-z0-9])\s*|:\s+)(.+)$/i,
 ];
 
 const LIST_PATTERNS = [/^(?:list|daftar)\s+(?:sesi|session)$/i];
