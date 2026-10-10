@@ -15,10 +15,25 @@
 - Connects to a waxum instance — either a **remote URL** (self-hosted server) or a **bundled binary** you point it at (spawned as a local child process, talking to `127.0.0.1`).
 - Streams incoming WhatsApp messages live over waxum's `/events/tail` SSE endpoint.
 - **Reads incoming messages aloud** (ElevenLabs TTS) — on by default, toggle in settings.
-- **Voice commands** via push-to-talk (ElevenLabs STT): hold the mic button, speak, release.
+- **Voice commands** over ElevenLabs' realtime STT websocket: the mic stays
+  open and everything is transcribed, but only an utterance that opens with the
+  wake word — **"hey jarvis"** — is treated as a command. Say the wake word, the
+  app answers "Ya?", and the next thing you say is the command (8s window). The
+  wake word is what stops a permanently-open mic from acting on overheard
+  conversation; the on-screen hint says it out loud because there is otherwise
+  no way to discover it.
   - "baca pesan" / "bacain pesan dari budi" — reads the latest message, optionally scoped to a contact
+  - "cek pesan di grup ini" / "cek pesan di grup keluarga" — reads the latest message in a group
   - "balas ke budi bilang otw" / "kirim pesan ke budi bilang otw" — sends a text message
   - "list sesi" — how many active conversations the app has seen this run
+- **Typed commands** — the box at the bottom takes the same commands as text and
+  is *not* wake-word gated (there is nothing to gate when you typed it on
+  purpose), which is also the only way to drive it on a machine with no mic.
+- **Contacts resolve beyond what you have seen this run**: the chats the stream
+  has shown are tried first (instant, offline), then waxum's stored messages, so
+  "balas ke budi" works for someone who has not messaged you since launch, and
+  "baca pesan dari budi" reads waxum's stored history for that chat instead of
+  only what arrived while the app happened to be open.
 - Design matches the rest of the waxum ecosystem (waxum-studio's charcoal/emerald palette, Geist font).
 
 ## Stack
@@ -27,21 +42,30 @@ Tauri v2 (Rust backend + Vue 3 / Tailwind frontend, one codebase for desktop and
 
 ```
 src/                    Vue frontend
-├── App.vue               orchestrator: settings gate, message log, voice bar
+├── App.vue               orchestrator: settings gate, message log, command pipeline
 ├── components/
-│   ├── SetupView.vue        connection mode, waxum + ElevenLabs settings
-│   └── VoiceBar.vue         push-to-talk button
+│   ├── SetupView.vue        connection mode, waxum + ElevenLabs + AI settings
+│   └── VoiceBar.vue         always-open realtime mic, mute, reconnect
 └── lib/
     ├── settings.ts           tauri-plugin-store persistence
     ├── waxum.ts               typed wrappers around the Tauri commands
-    ├── voice.ts               MediaRecorder capture + TTS playback
-    └── commandParser.ts       transcript -> intent
+    ├── voice.ts               TTS playback
+    ├── realtimeVoice.ts       ElevenLabs realtime STT websocket
+    ├── commandParser.ts       transcript -> intent
+    ├── contactMatch.ts        name scoring + waxum payload normalisation
+    └── ai.ts                  AI settings, streaming and tool-call events
+
+tests/                  node --test unit tests (npm test)
 
 src-tauri/src/          Rust backend
 ├── waxum.rs               waxum REST client (status, sessions, send, search)
-├── elevenlabs.rs          ElevenLabs TTS + STT
+├── elevenlabs.rs          ElevenLabs TTS + STT (incl. realtime token minting)
 ├── events.rs              SSE tail -> Tauri events, with reconnect/backoff
+├── pairing.rs             pairing run + QR/pair-code events
 ├── bundled.rs             spawn/kill a local waxum binary
+├── download.rs            fetch/update that binary from GitHub releases
+├── ai.rs                  OpenAI-compatible client + tool calls
+├── linux_media.rs         enable mic access in the WebKitGTK webview
 └── commands.rs            #[tauri::command] surface the frontend calls
 ```
 
@@ -95,16 +119,34 @@ sudo dnf install gstreamer1-plugins-base gstreamer1-plugins-good pipewire-gstrea
 sudo apt install gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-pipewire  # Debian/Ubuntu
 ```
 
+## Tests
+
+```bash
+npm test              # frontend: node --test over tests/
+cargo test            # backend: unit tests in src-tauri/
+```
+
+The frontend tests use node's built-in runner (no test framework
+installed) over the pure modules — the command parser and the
+name-scoring/payload-normalising helpers in `src/lib/contactMatch.ts`.
+Anything that needs a live Tauri runtime or a waxum server is not covered
+there.
+
 ## Notes / known limitations (v1)
 
 - The command parser is a fixed set of Indonesian regex patterns
   (`src/lib/commandParser.ts`), not free-form NL — extend the pattern
   lists there rather than reaching for an LLM unless open-ended commands
-  become a real requirement.
-- Contact resolution ("balas ke budi") matches against chats the app has
-  *seen* in this run (via the SSE stream), not waxum's full contact list —
-  say a contact's message once before addressing them by voice, or extend
-  `resolveChat()` in `App.vue` to hit `waxum_search` as a fallback.
+  become a real requirement. Those patterns are matched first and answered
+  locally, with no network call: only a transcript that matches none of them
+  goes to the configured AI endpoint. So "list sesi" never waits on a model,
+  and never fails because the endpoint is slow or down.
+- Contact resolution prefers names the app has actually seen, then falls
+  back to waxum's `/messages/search` (`resolveContact()` in `App.vue`).
+  When a name is genuinely ambiguous the highest-scoring candidate wins
+  (exact > whole word > substring > edit distance, all in
+  `src/lib/contactMatch.ts`) instead of the app asking which one you meant —
+  so "balas ke budi" with two contacts called Budi can pick the wrong one.
 - Auto-reconnect and backoff on the SSE stream is handled Rust-side
   (`events.rs`); the bundled-binary process is not auto-restarted if it
   crashes — restart it from settings.

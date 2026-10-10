@@ -280,6 +280,10 @@ function chatDisplayName(msg: IncomingMessage): string {
 }
 
 async function handleIncoming(msg: IncomingMessage) {
+  // A non-message event on the same stream (or a truncated payload) has no
+  // `data`; without this guard it throws inside the listener and the whole
+  // message is lost with nothing in the log to explain why.
+  if (!msg?.data) return;
   if (msg.data.is_from_me) return;
   if (seenMessageIds.has(msg.data.message_id)) return;
   seenMessageIds.add(msg.data.message_id);
@@ -610,6 +614,15 @@ onUnmounted(() => {
       </div>
       <div v-if="awaitingCommand" class="mt-1 text-[9px] uppercase tracking-widest text-cyber-pink hud-glow-text">
         mendengarkan perintah…
+      </div>
+      <!-- The wake word is the one thing about this app you cannot discover
+           by looking at it: the mic is always open and silently discards
+           anything that does not start with it, so without this line voice
+           commands look broken rather than gated. -->
+      <div
+        v-else-if="sessionReady && settings?.elevenLabsApiKey"
+        class="mt-1 text-[9px] uppercase tracking-widest text-hud-400/25">
+        ucapkan “hey jarvis” lalu perintahnya
       </div>
     </div>
 
