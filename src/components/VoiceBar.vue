@@ -25,12 +25,16 @@ let realtime: RealtimeVoice | null = null;
 const RETRY_MIN_MS = 1000;
 const RETRY_MAX_MS = 15000;
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
+/** True while a connect is in flight, so the watcher and a retry can't both
+ * walk into start() and end up with two live mic captures. */
+let connecting = false;
 let retryDelay = RETRY_MIN_MS;
 /** One log line per outage, not one per attempt. */
 let failureReported = false;
+let unmounted = false;
 
 function wanted(): boolean {
-  return props.active && !muted.value;
+  return !unmounted && props.active && !muted.value;
 }
 
 function clearRetry() {
@@ -87,10 +91,11 @@ watch(
 );
 
 async function start() {
-  if (listening.value || !props.settings.elevenLabsApiKey) {
+  if (listening.value || connecting || !props.settings.elevenLabsApiKey) {
     if (!props.settings.elevenLabsApiKey) emit("error", "realtime mode needs an ElevenLabs API key in settings");
     return;
   }
+  connecting = true;
   const rv = new RealtimeVoice();
   realtime = rv;
   try {
@@ -103,25 +108,42 @@ async function start() {
       } else if (e.kind === "error") {
         emit("error", e.message);
       } else if (e.kind === "closed") {
+        // Ignore a socket that is no longer the current one: stop() closes
+        // the websocket, so every replaced instance reports `closed` later,
+        // and acting on it flipped the UI to "standby" over a live mic and
+        // armed a retry that could start a third instance.
+        if (realtime !== rv) return;
         // Tear the capture side down too, or every retry leaks a mic
         // stream and an AudioContext.
         rv.stop();
-        if (realtime === rv) realtime = null;
+        realtime = null;
         listening.value = false;
         partial.value = "";
         scheduleRetry("terputus");
       }
     });
-    if (realtime !== rv) return; // stopped while connecting
+    if (realtime !== rv) {
+      // Replaced or stopped while connecting -- tear down what this instance
+      // just opened instead of leaving an unowned socket and mic stream.
+      rv.stop();
+      return;
+    }
     rv.setSuspended(props.speaking);
     listening.value = true;
     retryDelay = RETRY_MIN_MS;
     failureReported = false;
   } catch (e) {
-    emit("error", `realtime connect failed: ${e}`);
+    // One line per outage, not one per attempt -- a persistent failure
+    // retries every 1-15s and would otherwise own the whole log.
+    if (!failureReported) {
+      failureReported = true;
+      emit("error", `realtime connect failed: ${e}`);
+    }
     rv.stop();
     if (realtime === rv) realtime = null;
     scheduleRetry("gagal tersambung");
+  } finally {
+    connecting = false;
   }
 }
 
@@ -140,6 +162,7 @@ function toggleMute() {
 }
 
 onUnmounted(() => {
+  unmounted = true;
   clearRetry();
   realtime?.stop();
 });

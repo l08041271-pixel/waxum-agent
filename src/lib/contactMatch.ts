@@ -179,12 +179,12 @@ export function extractContacts(payload: unknown): ContactCandidate[] {
     if (!jid || !jid.includes("@") || seen.has(jid)) continue;
     const isGroup =
       pick(row, ["chat_type", "type"]).toLowerCase() === "group" || jid.endsWith("@g.us");
-    const name =
-      (isGroup
-        ? pick(row, ["chat_name", "subject", "group_name"])
-        : pick(row, ["chat_name", "contact_name", "push_name", "name"])) ||
-      pick(row, ["push_name", "sender_name", "name"]) ||
-      jidName(jid);
+    // A group must never be named after the member whose message matched:
+    // that would resolve "balas ke siti" to the group Siti posted in and put
+    // the reply in front of everyone.
+    const name = isGroup
+      ? pick(row, ["chat_name", "subject", "group_name"]) || jidName(jid)
+      : pick(row, ["chat_name", "contact_name", "push_name", "name"]) || jidName(jid);
     seen.add(jid);
     out.push({ name, jid });
   }

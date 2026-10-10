@@ -107,26 +107,33 @@ function submitTyped() {
 }
 const log = reactive<{ id: string; text: string; kind: "in" | "out" | "system"; time: string }[]>([]);
 
-/** chat display name -> jid, learned from every incoming SSE message so
- * voice commands can say "balas ke budi" instead of a raw JID. */
+/** Chats the app knows about, keyed by jid, learned from every incoming
+ * SSE message so voice commands can say "balas ke budi" instead of a raw
+ * JID. Keyed by jid rather than by display name because names are not
+ * unique: two contacts both saved as "Ayah", or a duplicated push name,
+ * used to collapse into one entry whose jid was overwritten by whoever
+ * messaged last -- so "balas ke ayah" could deliver to the wrong person.
+ * The name is just the searchable label. */
 interface ChatEntry {
+  name: string;
   jid: string;
   messages: string[]; // oldest first, capped — enough for "cek pesan di grup ini"
 }
 const HISTORY_PER_CHAT = 10;
 const knownChats = reactive(new Map<string, ChatEntry>());
 
-/** Group whose messages arrived most recently -- what "grup ini" means in
- * "cek pesan di grup ini". */
+/** Most recently active chat / group, for "baca pesan" with no name and for
+ * "grup ini". Set from live traffic and history alike. */
+let lastChatJid = "";
 let lastGroupJid = "";
 
 function appendChatMessage(name: string, jid: string, text: string) {
-  const key = name.toLowerCase();
-  const entry = knownChats.get(key) ?? { jid, messages: [] };
-  entry.jid = jid;
+  const entry = knownChats.get(jid) ?? { name, jid, messages: [] };
+  entry.name = name;
   entry.messages.push(text);
   if (entry.messages.length > HISTORY_PER_CHAT) entry.messages.shift();
-  knownChats.set(key, entry);
+  knownChats.set(jid, entry);
+  lastChatJid = jid;
   if (jid.endsWith("@g.us")) lastGroupJid = jid;
 }
 
@@ -160,10 +167,16 @@ let unlistenAiTool: (() => void) | null = null;
 const seenMessageIds = new Set<string>();
 let historyLoaded = false;
 
+/** Bumped on every line so the auto-follow watcher has something that always
+ * changes: `log.length` saturates at the 200-line cap, at which point the
+ * watcher stopped firing for good. */
+const logSeq = ref(0);
+
 function pushLog(text: string, kind: "in" | "out" | "system") {
   const time = new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   log.push({ id: crypto.randomUUID(), text, kind, time });
   if (log.length > 200) log.shift();
+  logSeq.value += 1;
 }
 
 /** Primes knownChats from waxum's stored history — silently, as context
@@ -213,6 +226,7 @@ function resetSessionCaches() {
   knownChats.clear();
   groupNames.clear();
   seenMessageIds.clear();
+  lastChatJid = "";
   lastGroupJid = "";
   historyLoaded = false;
   streamingReply.value = "";
@@ -319,10 +333,10 @@ async function handleIncoming(msg: IncomingMessage) {
  * edit distance) lives in lib/contactMatch.ts, shared with the live-search
  * fallback below and with the Rust side's `search_contact` tool. */
 function resolveChat(spokenName: string, groupsOnly = false): ChatEntry | undefined {
-  const entries = [...knownChats.entries()]
-    .filter(([, entry]) => !groupsOnly || entry.jid.endsWith("@g.us"))
-    .map(([name, entry]) => ({ name, entry }));
-  return bestMatch(spokenName, entries, (c) => c.name)?.entry;
+  const entries = [...knownChats.values()].filter(
+    (entry) => !groupsOnly || entry.jid.endsWith("@g.us"),
+  );
+  return bestMatch(spokenName, entries, (entry) => entry.name);
 }
 
 /** Resolves a spoken name to a chat, asking waxum when the local cache
@@ -343,12 +357,18 @@ async function resolveContact(
     const found: ContactCandidate[] = extractContacts(await waxumSearch(s, query)).filter(
       (c) => !groupsOnly || c.jid.endsWith("@g.us"),
     );
-    // The server already filtered by the query, so its first hit is a
-    // reasonable answer when no name scores high enough on its own.
-    const hit = bestMatch(query, found, (c) => c.name) ?? found[0];
+    // Only a hit whose own name matches is good enough. `waxum_search` is a
+    // *message-body* search -- its rows are the chats of messages that
+    // happen to contain the spoken words, not a contact list -- so falling
+    // back to the first hit would happily deliver "balas ke budi" to
+    // whichever group happened to be discussing Budi.
+    const hit = bestMatch(query, found, (c) => c.name);
     if (!hit) return undefined;
-    const entry: ChatEntry = { jid: hit.jid, messages: [] };
-    knownChats.set(hit.name.toLowerCase(), entry);
+    // Never clobber an entry that already holds history for this jid.
+    const existing = knownChats.get(hit.jid);
+    if (existing) return existing;
+    const entry: ChatEntry = { name: hit.name, jid: hit.jid, messages: [] };
+    knownChats.set(hit.jid, entry);
     return entry;
   } catch (e) {
     pushLog(`pencarian kontak gagal: ${e}`, "system");
@@ -357,9 +377,15 @@ async function resolveContact(
 }
 
 /** The most recently active group -- "cek pesan di grup ini". */
+/** Chats that have actually carried a message this run -- an entry created
+ * by a contact lookup has no messages and is not a conversation the user
+ * has seen. */
+function activeChatCount(): number {
+  return [...knownChats.values()].filter((e) => e.messages.length > 0).length;
+}
+
 function currentGroup(): ChatEntry | undefined {
-  if (!lastGroupJid) return undefined;
-  return [...knownChats.values()].find((e) => e.jid === lastGroupJid);
+  return lastGroupJid ? knownChats.get(lastGroupJid) : undefined;
 }
 
 /** Latest messages straight from waxum for one chat, oldest-first, merged
@@ -371,8 +397,12 @@ async function fetchChatLines(s: Settings, jid: string): Promise<string[]> {
     const lines = chronological(extractMessages(await waxumChatMessages(s, jid, 10))).map(
       messageLine,
     );
-    const cached = [...knownChats.values()].find((e) => e.jid === jid);
-    if (cached && lines.length) cached.messages = lines.slice(-HISTORY_PER_CHAT);
+    const cached = knownChats.get(jid);
+    if (cached && lines.length) {
+      cached.messages = lines.slice(-HISTORY_PER_CHAT);
+      lastChatJid = jid;
+      if (jid.endsWith("@g.us")) lastGroupJid = jid;
+    }
     return lines;
   } catch (e) {
     pushLog(`gagal memuat pesan: ${e}`, "system");
@@ -452,7 +482,9 @@ async function processCommand(s: Settings, raw: string) {
       case "read_latest": {
         const entry = intent.from
           ? await resolveContact(intent.from)
-          : [...knownChats.values()].at(-1);
+          : lastChatJid
+            ? knownChats.get(lastChatJid)
+            : undefined;
         if (!entry) {
           await speakState(s, "Tidak ada pesan yang sesuai dalam basis data.");
           break;
@@ -460,11 +492,12 @@ async function processCommand(s: Settings, raw: string) {
         // A named chat is read from waxum directly -- the local cache only
         // holds what arrived this run, so "baca pesan dari budi" used to
         // answer "no such message" for anyone who had not just messaged us.
-        let lines = entry.messages;
-        if (intent.from) {
-          const live = await fetchChatLines(s, entry.jid);
-          if (live.length) lines = live;
-        }
+        // Always ask waxum for the chat's stored history rather than
+        // trusting the local cache: the cache only holds what arrived this
+        // run, and a contact found through search has no cached messages at
+        // all, which used to read out as "Tidak ada isi pesan."
+        const live = await fetchChatLines(s, entry.jid);
+        const lines = live.length ? live : entry.messages;
         await speakState(s, lines.at(-1) ?? "Tidak ada isi pesan.");
         break;
       }
@@ -483,6 +516,8 @@ async function processCommand(s: Settings, raw: string) {
         }
         const live = await fetchChatLines(s, entry.jid);
         const lines = live.length ? live : entry.messages;
+        // Naming a group makes it "grup ini" for the next command.
+        lastGroupJid = entry.jid;
         const name = await resolveGroupName(entry.jid);
         const latest = lines.at(-1);
         await speakState(s, latest ? `Di ${name}: ${latest}` : `Belum ada pesan di ${name}.`);
@@ -506,7 +541,7 @@ async function processCommand(s: Settings, raw: string) {
         break;
       }
       case "list_sessions":
-        await speakState(s, `${knownChats.size} percakapan aktif terdeteksi.`);
+        await speakState(s, `${activeChatCount()} percakapan aktif terdeteksi.`);
         break;
     }
   } finally {
@@ -534,8 +569,8 @@ async function handleWithAi(s: Settings, transcript: string) {
     );
     return;
   }
-  const contacts: AiContact[] = [...knownChats.entries()].map(([name, e]) => ({
-    name,
+  const contacts: AiContact[] = [...knownChats.values()].map((e) => ({
+    name: e.name,
     jid: e.jid,
     recent: e.messages,
   }));
@@ -572,7 +607,7 @@ onMounted(async () => {
 /** Keeps the newest line visible. Only follows when the user is already at
  * the bottom, so scrolling back through history isn't yanked away by the
  * next incoming message. */
-watch([() => log.length, streamingReply], async () => {
+watch([logSeq, streamingReply], async () => {
   await nextTick();
   const el = logEl.value;
   if (!el) return;

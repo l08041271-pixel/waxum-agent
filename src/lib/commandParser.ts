@@ -15,8 +15,10 @@ export type Intent =
   | { kind: "unknown"; raw: string };
 
 const READ_PATTERNS = [
-  /^(?:tolong\s+)?bacain?\s+(?:pesan\s*)?(?:dari\s+(.+))?$/i,
-  /^(?:tolong\s+)?baca\s+pesan\s*(?:dari\s+(.+))?$/i,
+  // `baca(?:in)?` -- the old `bacain?` accepted "bacai", which is not a
+  // word, while rejecting nothing real; GROUP_PATTERNS already had it right.
+  /^(?:tolong\s+)?baca(?:in)?\s+(?:pesan\s*)?(?:dari\s+(.+))?$/i,
+  /^(?:tolong\s+)?baca(?:in)?\s+pesan\s*(?:dari\s+(.+))?$/i,
   /^(?:apa\s+)?pesan\s+(?:terbaru|masuk)\s*(?:dari\s+(.+))?$/i,
 ];
 
@@ -27,10 +29,17 @@ const GROUP_PATTERNS = [/^(?:cek|lihat|liat|baca(?:in)?)\s+pesan\s+(?:di|dari)\s
 /** Words that mean "the group I'm looking at", not a group *named* that. */
 const CURRENT_GROUP = /^(ini|itu|tersebut|yang ini|yang itu)$/i;
 
+// The separator between the name and the message body has to be careful
+// about where the name ends. A word separator needs whitespace in front of
+// it (`budi bilang otw`) *and* a non-word character after it, or a name that
+// merely starts with one of these words gets torn in half: "balas ke Bu
+// Isian bilang otw" would split at "Isi" and send "an bilang otw" to "Bu".
+// A colon is unambiguous, so it is allowed to butt straight up against the
+// name ("kirimkan ke budi: otw") -- which is how dictation usually arrives.
 const SEND_PATTERNS = [
-  /^(?:balas|reply)\s+(?:ke\s+)?(.+?)\s*(?:bilang|dengan|isi(?:nya)?|:)\s*(.+)$/i,
-  /^kirim(?:kan)?\s+pesan\s+ke\s+(.+?)\s*(?:bilang|isi(?:nya)?|:)\s*(.+)$/i,
-  /^kirim(?:kan)?\s+ke\s+(.+?)\s*(?:bilang|:)\s*(.+)$/i,
+  /^(?:balas|reply)\s+(?:ke\s+)?(.+?)(?:\s+(?:bilang|dengan|isi(?:nya)?)(?![a-z0-9])|:)\s*(.+)$/i,
+  /^kirim(?:kan)?\s+pesan\s+ke\s+(.+?)(?:\s+(?:bilang|isi(?:nya)?)(?![a-z0-9])|:)\s*(.+)$/i,
+  /^kirim(?:kan)?\s+ke\s+(.+?)(?:\s+(?:bilang)(?![a-z0-9])|:)\s*(.+)$/i,
 ];
 
 const LIST_PATTERNS = [/^(?:list|daftar)\s+(?:sesi|session)$/i];

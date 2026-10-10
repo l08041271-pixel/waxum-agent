@@ -88,6 +88,14 @@ test("extractContacts falls back to the jid local part when unnamed", () => {
   ]);
 });
 
+test("an unnamed group is never named after the member who posted", () => {
+  // Otherwise "balas ke siti" resolves to the group Siti posted in -- and
+  // puts the reply in front of everyone in it.
+  assert.deepEqual(extractContacts([{ chat_jid: "123@g.us", push_name: "Siti", body: "makan" }]), [
+    { name: "123", jid: "123@g.us" },
+  ]);
+});
+
 test("extractMessages normalises history rows and skips empty ones", () => {
   const rows = extractMessages({
     messages: [

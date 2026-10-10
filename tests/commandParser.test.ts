@@ -60,6 +60,42 @@ test("parses every send shape", () => {
   });
 });
 
+test("a name that starts with a separator word is not torn in half", () => {
+  // The loosened separator must still require whitespace before a word
+  // separator, or "Isian" matches the `isi` alternative and the name comes
+  // back as "Bu" with "an bilang otw" as the message.
+  assert.deepEqual(parseCommand("balas ke Bu Isian bilang otw"), {
+    kind: "send_message",
+    to: "Bu Isian",
+    text: "otw",
+  });
+  assert.deepEqual(parseCommand("kirim pesan ke Isian bilang otw"), {
+    kind: "send_message",
+    to: "Isian",
+    text: "otw",
+  });
+  assert.deepEqual(parseCommand("balas ke budi dengan senang hati"), {
+    kind: "send_message",
+    to: "budi",
+    text: "senang hati",
+  });
+});
+
+test("a colon may butt straight up against the contact name", () => {
+  assert.deepEqual(parseCommand("balas ke budi: otw"), { kind: "send_message", to: "budi", text: "otw" });
+  assert.deepEqual(parseCommand("balas ke budi:otw"), { kind: "send_message", to: "budi", text: "otw" });
+  assert.deepEqual(parseCommand("kirim pesan ke budi: otw"), {
+    kind: "send_message",
+    to: "budi",
+    text: "otw",
+  });
+});
+
+test("reads accept 'baca' and 'bacain', not the typo 'bacai'", () => {
+  assert.equal(parseCommand("bacai pesan dari budi").kind, "unknown");
+  assert.deepEqual(parseCommand("bacain pesan dari budi"), { kind: "read_latest", from: "budi" });
+});
+
 test("lists sessions", () => {
   assert.deepEqual(parseCommand("list sesi"), { kind: "list_sessions" });
   assert.deepEqual(parseCommand("daftar session"), { kind: "list_sessions" });
