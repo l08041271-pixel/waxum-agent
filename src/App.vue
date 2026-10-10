@@ -70,8 +70,8 @@ const assistantState = computed<"offline" | "idle" | "listening" | "thinking" | 
  * together (or an incoming message landing while a command's reply is being
  * spoken) used to start two <audio> elements at once, so the assistant read
  * both at the same time and neither was intelligible -- the whole point of
- * reading messages aloud. `pending` keeps the robot face on "speaking" for
- * as long as *anything* is still being spoken. */
+ * reading messages aloud. `pendingSpeech` keeps the robot face on "speaking"
+ * for as long as *anything* is still being spoken. */
 let speechQueue: Promise<void> = Promise.resolve();
 let pendingSpeech = 0;
 
@@ -284,6 +284,11 @@ async function handleIncoming(msg: IncomingMessage) {
   // `data`; without this guard it throws inside the listener and the whole
   // message is lost with nothing in the log to explain why.
   if (!msg?.data) return;
+  // Settings are still loading on the first few frames of a fresh launch:
+  // there is no log to write to and no voice settings to read from yet, and
+  // resolveGroupName() needs a live settings object to look a subject up.
+  const s = settings.value;
+  if (!s) return;
   if (msg.data.is_from_me) return;
   if (seenMessageIds.has(msg.data.message_id)) return;
   seenMessageIds.add(msg.data.message_id);
@@ -303,8 +308,8 @@ async function handleIncoming(msg: IncomingMessage) {
   appendChatMessage(chatName, msg.data.chat, msg.data.is_group ? `${sender}: ${text}` : text);
   pushLog(logLine, "in");
 
-  if (settings.value?.autoReadIncoming) {
-    await speakState(settings.value, spoken).catch((e) => pushLog(`tts failed: ${e}`, "system"));
+  if (s.autoReadIncoming) {
+    await speakState(s, spoken);
   }
 }
 
@@ -549,7 +554,10 @@ async function handleWithAi(s: Settings, transcript: string) {
 }
 
 onMounted(async () => {
-  await boot();
+  // Listeners before boot(): boot() -> connect() opens the SSE stream, and a
+  // message that arrived between the stream opening and the listener being
+  // attached was dropped on the floor. Anything missed while settings were
+  // still loading is backfilled by loadHistory() once the session is ready.
   unlistenMessage = await onIncomingMessage(handleIncoming);
   unlistenStatus = await onStreamStatus((m) => (statusLine.value = m));
   unlistenAiStream = await onAiStream((chunk) => {
@@ -558,6 +566,7 @@ onMounted(async () => {
   unlistenAiTool = await onAiTool((call) => {
     pushLog(`ai tool: ${call.name}(${JSON.stringify(call.arguments)})`, "system");
   });
+  await boot();
 });
 
 /** Keeps the newest line visible. Only follows when the user is already at
