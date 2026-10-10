@@ -148,8 +148,14 @@ there.
   `src/lib/contactMatch.ts`) instead of the app asking which one you meant —
   so "balas ke budi" with two contacts called Budi can pick the wrong one.
 - Auto-reconnect and backoff on the SSE stream is handled Rust-side
-  (`events.rs`); the bundled-binary process is not auto-restarted if it
-  crashes — restart it from settings.
+  (`events.rs`), and `VoiceBar.vue` does the same for the realtime mic
+  socket (1s doubling to 15s). That reconnect only fires on a socket
+  `close`/`error` event, so a connection that goes silently half-open
+  (laptop suspend, NAT timeout) still shows as listening with nothing
+  behind it — there is no heartbeat. Toggle the mic button to force a
+  fresh socket.
+- The bundled-binary process is not auto-restarted if it crashes —
+  restart it from settings.
 - `linux_media.rs` only fixes microphone access on Linux. macOS's
   WKWebView has its own separate, still-unresolved mic permission bug
   in wry ([wry#1195](https://github.com/tauri-apps/wry/issues/1195),
