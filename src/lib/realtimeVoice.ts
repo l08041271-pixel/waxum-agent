@@ -68,12 +68,32 @@ export class RealtimeVoice {
     ws.onerror = () => onEvent({ kind: "error", message: "realtime connection error" });
     ws.onclose = () => onEvent({ kind: "closed" });
 
+    // addEventListener (not ws.onopen/onerror/onclose) so the connect-time
+    // handlers don't clobber the runtime ones set above. Rejecting the
+    // moment the socket dies -- instead of only on the 8s timeout -- is
+    // what lets the caller retry promptly instead of sitting dead for
+    // eight seconds first.
     await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("timed out connecting")), 8000);
-      ws.onopen = () => {
+      const onOpen = () => settle(() => resolve());
+      const onError = () => settle(() => reject(new Error("socket error before it opened")));
+      const onClose = () => settle(() => reject(new Error("socket closed before it opened")));
+      const settle = (done: () => void) => {
         clearTimeout(timeout);
-        resolve();
+        ws.removeEventListener("open", onOpen);
+        ws.removeEventListener("error", onError);
+        ws.removeEventListener("close", onClose);
+        done();
       };
+      const timeout = setTimeout(
+        () => settle(() => {
+          ws.close();
+          reject(new Error("timed out connecting"));
+        }),
+        8000,
+      );
+      ws.addEventListener("open", onOpen);
+      ws.addEventListener("error", onError);
+      ws.addEventListener("close", onClose);
     });
 
     this.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });

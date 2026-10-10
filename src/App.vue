@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import SetupView from "./components/SetupView.vue";
 import VoiceBar from "./components/VoiceBar.vue";
 import PairingModal from "./components/PairingModal.vue";
@@ -54,6 +54,8 @@ const typedCommand = ref("");
  * TTS playback is in flight), then back to idle/listening. */
 const listening = ref(false);
 const transientState = ref<"thinking" | "speaking" | null>(null);
+/** The scrolling transcript pane, so new lines can be followed automatically. */
+const logEl = ref<HTMLElement | null>(null);
 /** Filled chunk-by-chunk from ai-stream events while the AI reply is being
  * generated, so the UI shows progress instead of a dead "thinking" state
  * for however long the full completion takes. */
@@ -64,13 +66,29 @@ const assistantState = computed<"offline" | "idle" | "listening" | "thinking" | 
   return listening.value ? "listening" : "idle";
 });
 
-async function speakState(s: Settings, text: string) {
+/** Utterances are queued, not fired off in parallel. Two messages arriving
+ * together (or an incoming message landing while a command's reply is being
+ * spoken) used to start two <audio> elements at once, so the assistant read
+ * both at the same time and neither was intelligible -- the whole point of
+ * reading messages aloud. `pending` keeps the robot face on "speaking" for
+ * as long as *anything* is still being spoken. */
+let speechQueue: Promise<void> = Promise.resolve();
+let pendingSpeech = 0;
+
+function speakState(s: Settings, text: string): Promise<void> {
+  pendingSpeech += 1;
   transientState.value = "speaking";
-  try {
-    await speak(s, text);
-  } finally {
-    transientState.value = null;
-  }
+  speechQueue = speechQueue
+    .catch(() => {})
+    .then(() => speak(s, text))
+    .catch((e) => pushLog(`tts failed: ${e}`, "system"))
+    .then(() => {
+      pendingSpeech -= 1;
+      if (pendingSpeech === 0 && transientState.value === "speaking") {
+        transientState.value = null;
+      }
+    });
+  return speechQueue;
 }
 
 function submitTyped() {
@@ -538,6 +556,17 @@ onMounted(async () => {
   });
 });
 
+/** Keeps the newest line visible. Only follows when the user is already at
+ * the bottom, so scrolling back through history isn't yanked away by the
+ * next incoming message. */
+watch([() => log.length, streamingReply], async () => {
+  await nextTick();
+  const el = logEl.value;
+  if (!el) return;
+  const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+  if (distanceFromBottom < 48) el.scrollTop = el.scrollHeight;
+});
+
 onUnmounted(() => {
   unlistenMessage?.();
   unlistenStatus?.();
@@ -599,7 +628,9 @@ onUnmounted(() => {
     </AnimatePresence>
 
     <div class="cyber-line" />
-    <main class="flex-1 overflow-y-auto px-4 py-2 flex flex-col gap-1.5 font-mono text-xs">
+    <main
+      ref="logEl"
+      class="flex-1 overflow-y-auto px-4 py-2 flex flex-col gap-1.5 font-mono text-xs">
       <AnimatePresence>
         <motion.div
           v-for="entry in log"

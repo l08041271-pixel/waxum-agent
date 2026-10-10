@@ -16,6 +16,44 @@ const muted = ref(false);
 const partial = ref("");
 let realtime: RealtimeVoice | null = null;
 
+/** Reconnect backoff for the realtime socket. It used to die silently: the
+ * websocket's `closed` event set listening=false and nothing ever started
+ * it again -- the `active` watcher had not changed, so voice input stayed
+ * dead (mic icon lit, nothing transcribed) until the user toggled mute or
+ * restarted the app. The SSE stream already reconnects on the Rust side;
+ * this is the same idea for the mic. */
+const RETRY_MIN_MS = 1000;
+const RETRY_MAX_MS = 15000;
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let retryDelay = RETRY_MIN_MS;
+/** One log line per outage, not one per attempt. */
+let failureReported = false;
+
+function wanted(): boolean {
+  return props.active && !muted.value;
+}
+
+function clearRetry() {
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+}
+
+function scheduleRetry(reason: string) {
+  if (!wanted() || retryTimer) return;
+  if (!failureReported) {
+    failureReported = true;
+    emit("error", `realtime ${reason} — mencoba menyambung ulang`);
+  }
+  const delay = retryDelay;
+  retryDelay = Math.min(retryDelay * 2, RETRY_MAX_MS);
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    if (wanted()) void start();
+  }, delay);
+}
+
 watch(listening, (v) => emit("listening", v));
 
 // Half-duplex turn-taking, same as Gemini/ChatGPT voice mode: suspend
@@ -53,9 +91,10 @@ async function start() {
     if (!props.settings.elevenLabsApiKey) emit("error", "realtime mode needs an ElevenLabs API key in settings");
     return;
   }
-  realtime = new RealtimeVoice();
+  const rv = new RealtimeVoice();
+  realtime = rv;
   try {
-    await realtime.start(props.settings, (e) => {
+    await rv.start(props.settings, (e) => {
       if (e.kind === "partial") {
         partial.value = e.text;
       } else if (e.kind === "final") {
@@ -64,30 +103,46 @@ async function start() {
       } else if (e.kind === "error") {
         emit("error", e.message);
       } else if (e.kind === "closed") {
+        // Tear the capture side down too, or every retry leaks a mic
+        // stream and an AudioContext.
+        rv.stop();
+        if (realtime === rv) realtime = null;
         listening.value = false;
         partial.value = "";
+        scheduleRetry("terputus");
       }
     });
-    realtime.setSuspended(props.speaking);
+    if (realtime !== rv) return; // stopped while connecting
+    rv.setSuspended(props.speaking);
     listening.value = true;
+    retryDelay = RETRY_MIN_MS;
+    failureReported = false;
   } catch (e) {
     emit("error", `realtime connect failed: ${e}`);
-    realtime = null;
+    rv.stop();
+    if (realtime === rv) realtime = null;
+    scheduleRetry("gagal tersambung");
   }
 }
 
 function stop() {
+  clearRetry();
   realtime?.stop();
   realtime = null;
   listening.value = false;
   partial.value = "";
+  retryDelay = RETRY_MIN_MS;
+  failureReported = false;
 }
 
 function toggleMute() {
   muted.value = !muted.value;
 }
 
-onUnmounted(() => realtime?.stop());
+onUnmounted(() => {
+  clearRetry();
+  realtime?.stop();
+});
 </script>
 
 <template>
